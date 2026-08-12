@@ -268,6 +268,15 @@ _sudo_password_cache_lock = threading.Lock()
 _callback_tls = threading.local()
 
 
+# Module-level slot for the live agent's tool_progress_callback.  We deliberately
+# use a module-level var (NOT the thread-local above) because the environment's
+# stdout drain loop runs in a SEPARATE daemon thread — a thread-local set on the
+# caller's thread would be invisible to it.  Single-threaded in practice for the
+# local terminal path; the terminal tool clears it in a finally-block so a crash
+# can't leak it into the next command.
+_agent_progress_cb = None
+
+
 def _get_sudo_password_callback():
     return getattr(_callback_tls, "sudo_password", None)
 
@@ -278,7 +287,6 @@ def _get_approval_callback():
 
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
-
     Per-thread scope — ACP sessions that run concurrently in a
     ThreadPoolExecutor each have their own callback slot.
     """
@@ -287,12 +295,59 @@ def set_sudo_password_callback(cb):
 
 def set_approval_callback(cb):
     """Register a callback for dangerous command approval prompts.
-
     Per-thread scope — ACP sessions that run concurrently in a
     ThreadPoolExecutor each have their own callback slot. See
     GHSA-qg5c-hvr5-hjgr.
     """
     _callback_tls.approval = cb
+
+
+def get_tool_progress_callback():
+    """Return the module-level agent tool_progress_callback (set per run)."""
+    return _agent_progress_cb
+
+
+def set_tool_progress_callback(cb):
+    """Register the current agent's tool_progress_callback (module-level)."""
+    global _agent_progress_cb
+    _agent_progress_cb = cb
+
+
+def _stream_to_progress(chunk: str) -> None:
+    """Relay a stdout chunk to the agent's tool-progress bubble (best-effort).
+
+    Called from the environment's drain loop (a separate daemon thread) for
+    LOCAL foreground runs.  Reads the module-level callback (NOT thread-local —
+    the drain thread wouldn't see a thread-local).  Silently no-ops if unset,
+    and NEVER raises — a streaming glitch must not corrupt command output.
+
+    The chunk is the RAW stdout stream — it may still contain the in-band
+    ``__HERMES_CWD_...__`` cwd marker that terminal_tool strips only at the
+    end of the run.  Filter that marker here so it never leaks into a bubble
+    as a stray line.  (The full output is still returned normally by
+    terminal_tool; this only affects the live preview.)
+    """
+    if not chunk:
+        return
+    # Drop any cwd-marker noise from the live preview.  Matches the marker
+    # shape emitted by LocalEnvironment._update_cwd / _extract_cwd_from_output.
+    if "__HERMES_CWD_" in chunk:
+        # If the whole chunk is just the marker (+ whitespace), skip entirely.
+        _stripped = chunk.replace("__HERMES_CWD_", "").strip()
+        if not _stripped or _stripped.startswith("/home") or _stripped.endswith("__"):
+            return
+        # Otherwise strip the marker token out of the middle of a line.
+        import re as _re
+        chunk = _re.sub(r"__HERMES_CWD_[0-9a-f]+__", "", chunk)
+    cb = _agent_progress_cb
+    if cb is None:
+        return
+    try:
+        # New event type the gateway progress sender understands:
+        # incremental stdout line for the in-flight tool bubble.
+        cb("tool.output", None, chunk, None)
+    except Exception:
+        pass
 
 
 def _get_sudo_password_cache_scope() -> str:
@@ -1078,7 +1133,6 @@ import sys
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
-NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; the same applies to `cmd || echo failed`, which also masks the exit code.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
@@ -3180,15 +3234,6 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
-                            # Stamp the spawning conversation's session-db id
-                            # so the gateway's completion pre-flight
-                            # (_classify_completion_target) can drop the
-                            # notification when the user closes this session
-                            # (/new) before the process finishes, instead of
-                            # injecting it into the chat's NEW session.
-                            proc_session.parent_session_id = _gse(
-                                "HERMES_SESSION_ID", ""
-                            )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -3227,7 +3272,6 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
-                            "parent_session_id": proc_session.parent_session_id,
                         })
 
                 # Set watch patterns for output monitoring
@@ -3279,7 +3323,20 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    # ── Real-time stdout → tool-progress bubble (LOCAL + foreground only) ──
+                    # Set a module-level callback the environment drains through.
+                    # Gated so non-local backends (docker/modal/ssh) and background
+                    # spawns are untouched. Cleared in finally so a crash can't
+                    # leave a stale callback leaking into the next command.
+                    if not background and env_type == "local":
+                        from tools.environments import base as _env_base
+                        _env_base._STREAM_CALLBACK = _stream_to_progress
+                    try:
+                        result = env.execute(command, **execute_kwargs)
+                    finally:
+                        if not background and env_type == "local":
+                            from tools.environments import base as _env_base
+                            _env_base._STREAM_CALLBACK = None
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
@@ -3322,14 +3379,7 @@ def terminal_tool(
             # (docstring: "Working directory for this command"). Recording it
             # would hijack the session's durable cwd for every later command
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
-            #
-            # AND only when the command actually reported its cwd. The marker
-            # is printed after the command returns, so an interrupted / killed
-            # / timed-out command emits none and env.cwd still holds whatever
-            # the last command to FINISH left there — on a shared env, that is
-            # another session's directory. Recording it silently re-homes this
-            # session into a directory the user never opened.
-            if not workdir and (result or {}).get("cwd_observed"):
+            if not workdir:
                 record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
@@ -3424,19 +3474,6 @@ def terminal_tool(
                     failure_hint = annotate_failure(command, returncode, output)
                 except Exception:
                     failure_hint = None
-            elif returncode == 0:
-                # Masked-success backstop: `cargo build | tail -20` returns
-                # tail's exit 0 even when the build failed (bash reports the
-                # last pipeline command's status; same for `cmd || echo ...`).
-                # When the command shape can mask an upstream failure AND the
-                # output carries strong failure indicators, warn the model so
-                # exit_code 0 isn't read as a success signal. Advisory only —
-                # the exit code itself is never modified.
-                try:
-                    from tools.terminal_hints import annotate_masked_success
-                    failure_hint = annotate_masked_success(command, output)
-                except Exception:
-                    failure_hint = None
 
             result_dict = {
                 "output": output,
@@ -3449,13 +3486,8 @@ def terminal_tool(
             # defensive 'cd X && ' prefix because the model can't see cwd
             # state; echoing it on change removes the guesswork (pattern
             # borrowed from crush's <cwd> injection).
-            #
-            # Gated on the same observation flag as the record above: without
-            # it, an interrupted command echoes the shared env's leftover cwd
-            # and tells the model it moved to a directory another session
-            # opened.
             try:
-                post_cwd = getattr(env, "cwd", None) if (result or {}).get("cwd_observed") else None
+                post_cwd = getattr(env, "cwd", None)
                 if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
@@ -3470,17 +3502,9 @@ def terminal_tool(
                 try:
                     _sp = Path(spill_file_path)
                     raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
-                    from tools.spill_safety import write_text_exclusive
-
-                    # Rewrite in place via lstat-checked unlink + exclusive
-                    # create so the redacted copy can't be diverted through a
-                    # symlink planted between the collector's write and now.
-                    write_text_exclusive(
-                        _sp,
+                    _sp.write_text(
                         redact_terminal_output(strip_ansi(raw_spill), command),
-                        private=True,
-                        overwrite=True,
-                        errors="replace",
+                        encoding="utf-8", errors="replace",
                     )
                     result_dict["output_total_chars"] = spill_total_chars
                     result_dict["full_output_path"] = spill_file_path
@@ -3830,17 +3854,6 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
-    # Mirror of execute_code's misplaced-argument recovery: models sometimes
-    # send execute_code's ``code`` argument here. Without this, the call
-    # falls through to command=None and fails with "Invalid command:
-    # expected string, got NoneType" — naming neither the stray argument
-    # nor the right tool.
-    if "command" not in args and "code" in args:
-        return tool_error(
-            "terminal received a 'code' parameter, but it requires a shell "
-            "command in 'command'. Use execute_code(code=...) for Python; "
-            "for shell, retry as terminal(command=...)."
-        )
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),

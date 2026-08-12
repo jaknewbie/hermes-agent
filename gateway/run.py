@@ -4086,6 +4086,15 @@ class TurnRunner:
         if not ctx.progress_queue or not ctx._run_still_current():
             return
 
+        # Real-time stdout streaming from LOCAL foreground terminal runs.
+        # Each chunk is queued as its own progress line so the bubble
+        # accumulates output live (rather than only showing the command
+        # then the final result).  Non-terminal events fall through.
+        if event_type == "tool.output":
+            if preview:
+                ctx.progress_queue.put(preview)
+            return
+
         # First-touch onboarding: the first time a tool takes longer than
         # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
         # (progress_mode == "all"), append a one-time hint suggesting
@@ -4731,8 +4740,13 @@ class TurnRunner:
                 # API calls to avoid hitting Telegram flood control.
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
+                #
+                # Live stdout streaming (tool.output) uses a tighter
+                # interval so incremental lines appear promptly instead of
+                # being dropped while waiting out the slower default.
                 _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                _interval = 0.4 if (isinstance(raw, str) and raw) else _PROGRESS_EDIT_INTERVAL
+                _remaining = _interval - (_now - _last_edit_ts)
                 if _remaining > 0:
                     # Wait out the throttle interval, then loop back to
                     # drain any additional queued messages before sending
@@ -17513,6 +17527,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            # MOD (jak-local-mods): append the context/model footer built from
+            # the per-turn context fill that agent/turn_finalizer.py writes to
+            # ~/.hermes/context_status.json.  Skips empty responses, already-
+            # footed text, and never guesses values (falls back to N/A when the
+            # file is absent).  Re-applied after the upstream merge dropped the
+            # original call site.
+            if isinstance(_agent_result, dict):
+                _final_text = str(_agent_result.get("final_response") or "")
+            elif isinstance(_agent_result, str):
+                _final_text = _agent_result
+            else:
+                _final_text = ""
+            if _final_text.strip() and "Context:" not in _final_text:
+                _footer = self._build_context_footer()
+                if _footer:
+                    _final_text = _final_text.rstrip() + "\n\n" + _footer
+                    if isinstance(_agent_result, dict):
+                        _agent_result["final_response"] = _final_text
+                    else:
+                        _agent_result = _final_text
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -17541,6 +17575,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+
+    def _build_context_footer(self) -> str:
+        """Build the auto-appended context/model footer shown at the end of
+        every user-facing response. Reads the per-turn context fill that
+        agent/turn_finalizer.py writes to ~/.hermes/context_status.json.
+        Returns "" when the file is missing/unparseable so the caller skips
+        appending rather than guessing placeholder values."""
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            _cf = _Path(os.path.expanduser("~/.hermes/context_status.json"))
+            if not _cf.exists():
+                return "Context: N/A\nModel: N/A"
+            try:
+                _d = _json.loads(_cf.read_text(encoding="utf-8"))
+            except Exception:
+                return "Context: N/A\nModel: N/A"
+            _used = int(_d.get("context_used", 0) or 0)
+            _max = int(_d.get("context_max", 0) or 0)
+            _pct = float(_d.get("context_percent", 0) or 0)
+            if not _max:
+                _pct = round((_used / 262144) * 100, 1) if _used else 0.0
+                _max = 262144
+            _model = _d.get("model") or "N/A"
+            _prov = _d.get("provider") or "N/A"
+            return f"Context: {_used:,} / {_max:,} ({_pct:.0f}%)\nModel: {_model} ({_prov})"
+        except Exception:
+            return ""
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.

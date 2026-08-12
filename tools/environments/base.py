@@ -14,6 +14,7 @@ import re
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -27,6 +28,11 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
+
+# Module-level streaming hook for real-time stdout → tool-progress bubble.
+# Set by tools.terminal_tool for LOCAL foreground runs; None means disabled
+# (default — output just accumulates silently, byte-identical to before).
+_STREAM_CALLBACK = None
 
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
 # HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
@@ -112,15 +118,8 @@ class _BoundedOutputCollector:
             return
         try:
             if self._spill_fh is None:
-                from tools.spill_safety import ensure_spill_dir, open_exclusive
-
-                # Raw pre-redaction output: private perms + symlink-refusing
-                # exclusive create (a planted link must fail the spill, never
-                # redirect the write).
-                ensure_spill_dir(self._spill_path.parent, private=True)
-                self._spill_fh = open_exclusive(
-                    self._spill_path, private=True, errors="replace"
-                )
+                self._spill_path.parent.mkdir(parents=True, exist_ok=True)
+                self._spill_fh = open(self._spill_path, "w", encoding="utf-8", errors="replace")
                 # Backfill everything retained so far so the file holds the
                 # stream from byte 0, not just from the overflow point.
                 backlog = "".join(self._head) + "".join(self._tail)
@@ -1058,6 +1057,14 @@ class BaseEnvironment(ABC):
         # U+FFFD substitution rather than clobbering the whole buffer.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
+        # ── OPTIONAL real-time stdout streaming to tool-progress bubble ──
+        # Gated on a module-level flag set by the terminal tool for LOCAL
+        # foreground runs only. If unset (default None), behaviour is
+        # byte-identical to before — chunks just accumulate silently. Any
+        # error is swallowed so a misbehaving callback can never wedge
+        # command output.
+        _stream_cb = getattr(sys.modules[__name__], "_STREAM_CALLBACK", None)
+
         def _drain_iterable(stream):
             # Fallback path: ``stream`` is not backed by a real OS file
             # descriptor (no usable ``fileno()``).  This covers in-memory
@@ -1111,7 +1118,13 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        _decoded = decoder.decode(chunk)
+                        output.append(_decoded)
+                        if _stream_cb is not None:
+                            try:
+                                _stream_cb(_decoded)
+                            except Exception:
+                                pass
                 except (ValueError, OSError):
                     pass
                 finally:
@@ -1136,7 +1149,13 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        _decoded = decoder.decode(chunk)
+                        output.append(_decoded)
+                        if _stream_cb is not None:
+                            try:
+                                _stream_cb(_decoded)
+                            except Exception:
+                                pass  # never wedge output on a bad callback
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -1340,13 +1359,6 @@ class BaseEnvironment(ABC):
 
         Updates self.cwd and strips the marker from result["output"].
         Used by remote backends (Docker, SSH, Modal, Daytona, Singularity).
-
-        Sets ``result["cwd_observed"]`` when the marker yielded a directory for
-        THIS command. The wrapper prints the marker after the command returns,
-        so a killed / timed-out command never emits one and ``self.cwd`` keeps
-        whatever the previous command left there. That environment is shared by
-        every session, so callers must not attribute an unobserved cwd to the
-        session that ran this command (see terminal_tool's session-cwd record).
         """
         output = result.get("output", "")
         marker = self._cwd_marker
@@ -1363,7 +1375,6 @@ class BaseEnvironment(ABC):
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
             self.cwd = cwd_path
-            result["cwd_observed"] = True
 
         # Strip the marker line AND the \n we injected before it.
         # The wrapper emits: printf '\n__MARKER__%s__MARKER__\n'
