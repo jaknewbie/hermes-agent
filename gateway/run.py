@@ -17527,26 +17527,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
-            # MOD (jak-local-mods): append the context/model footer built from
-            # the per-turn context fill that agent/turn_finalizer.py writes to
-            # ~/.hermes/context_status.json.  Skips empty responses, already-
-            # footed text, and never guesses values (falls back to N/A when the
-            # file is absent).  Re-applied after the upstream merge dropped the
-            # original call site.
-            if isinstance(_agent_result, dict):
-                _final_text = str(_agent_result.get("final_response") or "")
-            elif isinstance(_agent_result, str):
-                _final_text = _agent_result
-            else:
-                _final_text = ""
-            if _final_text.strip() and "Context:" not in _final_text:
-                _footer = self._build_context_footer()
-                if _footer:
-                    _final_text = _final_text.rstrip() + "\n\n" + _footer
-                    if isinstance(_agent_result, dict):
-                        _agent_result["final_response"] = _final_text
-                    else:
-                        _agent_result = _final_text
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -19931,24 +19911,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         display_reasoning = escape_code_fences_for_display(display_reasoning)
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
-            # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # MOD (jak-local-mods): context/model footer.  We reuse our own
+            # _build_context_footer() (reads ~/.hermes/context_status.json that
+            # agent/turn_finalizer.py writes each turn) instead of the upstream
+            # runtime_footer (off by default).  Streaming already delivered the
+            # body, so this fires as a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
-                    turn_seconds=_turn_seconds,
-                )
+                _footer_line = self._build_context_footer()
             except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
+                logger.debug("context_footer build failed: %s", _footer_err)
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
